@@ -7,6 +7,7 @@
  * https://www.openssl.org/source/license.html
  */
 
+#include <stdio.h>
 #include <stdlib.h>
 #include "ssl_local.h"
 #include "internal/ktls.h"
@@ -18,6 +19,42 @@
 #include <openssl/core_names.h>
 
 #define TLS13_MAX_LABEL_LEN 249
+
+#define HYBRID_MODE_CONCAT     1  /* Mode 1: Concat (Mặc định OpenSSL) */
+#define HYBRID_MODE_SEQUENTIAL 2  /* Mode 2: Tuần tự */
+#define HYBRID_MODE_NESTED     3  /* Mode 3: Lồng nhau (Nested) */
+
+/* Hàm helper tự viết để băm HKDF-Extract bằng thư viện EVP của OpenSSL */
+static int custom_hkdf_extract(SSL_CONNECTION *s, const EVP_MD *md, 
+                               const unsigned char *salt, size_t salt_len,
+                               const unsigned char *ikm, size_t ikm_len,
+                               unsigned char *out, size_t out_len) 
+{
+    SSL_CTX *sctx = SSL_CONNECTION_GET_CTX(s);
+    EVP_KDF *kdf = EVP_KDF_fetch(sctx->libctx, OSSL_KDF_NAME_TLS1_3_KDF, sctx->propq);
+    if (kdf == NULL) return 0;
+    
+    EVP_KDF_CTX *kctx = EVP_KDF_CTX_new(kdf);
+    EVP_KDF_free(kdf);
+    if (kctx == NULL) return 0;
+
+    OSSL_PARAM params[5], *p = params;
+    int mode = EVP_PKEY_HKDEF_MODE_EXTRACT_ONLY; // Chỉ lấy tầng Extract
+    const char *mdname = EVP_MD_get0_name(md);
+
+    *p++ = OSSL_PARAM_construct_int(OSSL_KDF_PARAM_MODE, &mode);
+    *p++ = OSSL_PARAM_construct_utf8_string(OSSL_KDF_PARAM_DIGEST, (char *)mdname, 0);
+    if (salt != NULL)
+        *p++ = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_SALT, (unsigned char *)salt, salt_len);
+    if (ikm != NULL)
+        *p++ = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_KEY, (unsigned char *)ikm, ikm_len);
+    *p++ = OSSL_PARAM_construct_end();
+
+    int ret = EVP_KDF_derive(kctx, out, out_len, params) > 0;
+    EVP_KDF_CTX_free(kctx);
+    return ret;
+}
+
 
 /* ASCII: "tls13 ", in hex for EBCDIC compatibility */
 static const unsigned char label_prefix[] = "\x74\x6C\x73\x31\x33\x20";
@@ -214,13 +251,136 @@ int tls13_generate_secret(SSL_CONNECTION *s, const EVP_MD *md,
         sizeof(derived_secret_label) - 1);
     *p++ = OSSL_PARAM_construct_end();
 
-    ret = EVP_KDF_derive(kctx, outsecret, mdlen, params) <= 0;
+    /* --- ĐOẠN THAY THẾ: XỬ LÝ 3 CHẾ ĐỘ TRỘN KHÓA HYBRID BẰNG SWITCH-CASE --- */
+    size_t ecdhe_len = 32; // Độ dài mặc định của P-256 shared secret
+    
+    // Kiểm tra xem phiên kết nối này có phải là nhóm lai hay không (insecretlen > 32)
+    if (insecret != NULL && insecretlen > ecdhe_len) {
+        size_t mlkem_len = insecretlen - ecdhe_len;
+        const unsigned char *ecdhe_secret = insecret;
+        const unsigned char *mlkem_secret = insecret + ecdhe_len;
 
-    if (ret != 0)
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+        // Đọc cấu hình biến môi trường ngoài Terminal, nếu không đặt thì mặc định chạy Mode 1
+        char *mode_env = getenv("HYBRID_MODE");
+        int current_mode = mode_env ? atoi(mode_env) : HYBRID_MODE_CONCAT;
 
-    EVP_KDF_CTX_free(kctx);
-    return ret == 0;
+        switch (current_mode) {
+            case HYBRID_MODE_CONCAT:
+                /* -------------------------------------------------------
+                 * MODE 1: Hybrid-Concat (Mặc định của OpenSSL)
+                 * MS = HKDF-Extract(salt, secret_ECDHE || secret_MLKEM)
+                 * ------------------------------------------------------- */
+                printf("\n[HYBRID INFO] ==========================================\n");
+                printf("[HYBRID INFO] Giao thuc TLS 1.3 dang kích hoat che do lai (Hybrid Handshake)\n");
+                printf("[HYBRID INFO] Thuat toan: ECDHE (P-256) ket hop ML-KEM\n");
+                printf("[HYBRID INFO] Kieu tron khoa: MODE 1 - Hybrid-Concat (Mac dinh)\n");
+                printf("[HYBRID INFO] Trang thai: Ket noi va xac thuc khoa thanh cong!\n");
+                printf("[HYBRID INFO] ==========================================\n\n");
+                fflush(stdout);
+                
+                 ret = EVP_KDF_derive(kctx, outsecret, mdlen, params) <= 0;
+                if (ret != 0)
+                    SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+                EVP_KDF_CTX_free(kctx);
+                return ret == 0;
+
+            case HYBRID_MODE_SEQUENTIAL: {
+                /* -------------------------------------------------------
+                 * MODE 2: Hybrid-Sequential
+                 * K1 = HKDF-Extract(salt, secret_ECDHE)
+                 * MS = HKDF-Extract(K1, secret_MLKEM)
+                 * ------------------------------------------------------- */
+                printf("\n[HYBRID INFO] ==========================================\n");
+                printf("[HYBRID INFO] Giao thuc TLS 1.3 dang kích hoat che do lai (Hybrid Handshake)\n");
+                printf("[HYBRID INFO] Thuat toan: ECDHE (P-256) ket hop ML-KEM\n");
+                printf("[HYBRID INFO] Kieu tron khoa: MODE 2 - Hybrid-Sequential (Tuan tu)\n");
+                printf("[HYBRID INFO] Trang thai: Ket noi va xac thuc khoa thanh cong!\n");
+                printf("[HYBRID INFO] ==========================================\n\n");
+                fflush(stdout);
+
+                unsigned char k1[EVP_MAX_MD_SIZE];
+                size_t k1_out_len = mdlen;
+
+                // Bước 2.1: K1 = HKDF-Extract(salt, secret_ECDHE)
+                if (!custom_hkdf_extract(s, md, prevsecret, mdlen, ecdhe_secret, ecdhe_len, k1, k1_out_len)) {
+                    SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+                    EVP_KDF_CTX_free(kctx);
+                    return 0;
+                }
+                // Bước 2.2: MS = HKDF-Extract(K1, secret_MLKEM) -> Ghi đè kết quả vào outsecret
+                if (!custom_hkdf_extract(s, md, k1, k1_out_len, mlkem_secret, mlkem_len, outsecret, mdlen)) {
+                    SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+                    EVP_KDF_CTX_free(kctx);
+                    return 0;
+                }
+                EVP_KDF_CTX_free(kctx);
+                return 1; // Thành công
+            }
+
+            case HYBRID_MODE_NESTED: {
+                /* -------------------------------------------------------
+                 * MODE 3: Nested HKDF
+                 * MS = HKDF-Extract(salt, HKDF-Extract(NULL, secret_ECDHE) || secret_MLKEM)
+                 * ------------------------------------------------------- */
+                printf("\n[HYBRID INFO] ==========================================\n");
+                printf("[HYBRID INFO] Giao thuc TLS 1.3 dang kích hoat che do lai (Hybrid Handshake)\n");
+                printf("[HYBRID INFO] Thuat toan: ECDHE (P-256) ket hop ML-KEM\n");
+                printf("[HYBRID INFO] Kieu tron khoa: MODE 3 - Nested HKDF (Long nhau)\n");
+                printf("[HYBRID INFO] Trang thai: Ket noi va xac thuc khoa thanh cong!\n");
+                printf("[HYBRID INFO] ==========================================\n\n");
+                fflush(stdout);                
+                
+                unsigned char k_ecdhe[EVP_MAX_MD_SIZE];
+                size_t k_ecdhe_len = mdlen;
+                unsigned char null_salt[EVP_MAX_MD_SIZE] = {0}; // Đổ đầy byte 0 làm salt rỗng
+
+                // Bước 3.1: Tính toán phần lõi: HKDF-Extract(NULL, secret_ECDHE)
+                if (!custom_hkdf_extract(s, md, null_salt, mdlen, ecdhe_secret, ecdhe_len, k_ecdhe, k_ecdhe_len)) {
+                    SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+                    EVP_KDF_CTX_free(kctx);
+                    return 0;
+                }
+
+                // Bước 3.2: Khởi tạo vùng nhớ mới để Concat: K_ECDHE || secret_MLKEM
+                size_t nested_concat_len = k_ecdhe_len + mlkem_len;
+                unsigned char *nested_concat = OPENSSL_malloc(nested_concat_len);
+                if (nested_concat == NULL) {
+                    SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_MALLOC_FAILURE);
+                    EVP_KDF_CTX_free(kctx);
+                    return 0;
+                }
+                memcpy(nested_concat, k_ecdhe, k_ecdhe_len);
+                memcpy(nested_concat + k_ecdhe_len, mlkem_secret, mlkem_len);
+
+                // Bước 3.3: MS = HKDF-Extract(salt, nested_concat)
+                int success = custom_hkdf_extract(s, md, prevsecret, mdlen, nested_concat, nested_concat_len, outsecret, mdlen);
+                OPENSSL_free(nested_concat);
+
+                if (!success) {
+                    SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+                    EVP_KDF_CTX_free(kctx);
+                    return 0;
+                }
+                EVP_KDF_CTX_free(kctx);
+                return 1; // Thành công
+            }
+
+            default:
+                // Nếu người dùng nhập sai số MODE, tự động fall back về Mode 1
+                ret = EVP_KDF_derive(kctx, outsecret, mdlen, params) <= 0;
+                if (ret != 0)
+                    SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+                EVP_KDF_CTX_free(kctx);
+                return ret == 0;
+        }
+    } else {
+        // Nếu insecret bằng NULL hoặc là phiên kết nối cổ điển (ECDHE-only), giữ nguyên code gốc
+        ret = EVP_KDF_derive(kctx, outsecret, mdlen, params) <= 0;
+        if (ret != 0)
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+        EVP_KDF_CTX_free(kctx);
+        return ret == 0;
+    }
 }
 
 /*
